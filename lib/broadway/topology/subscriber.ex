@@ -86,7 +86,7 @@ defmodule Broadway.Topology.Subscriber do
   end
 
   def handle_info(:cancel_consumers, %{terminator: terminator} = state) when terminator != nil do
-    if pid = GenServer.whereis(terminator) do
+    if pid = safe_whereis(terminator) do
       send(pid, {:done, self()})
     end
 
@@ -122,7 +122,7 @@ defmodule Broadway.Topology.Subscriber do
   ## Helpers
 
   defp subscribe(process_name, state) do
-    if pid = GenServer.whereis(process_name) do
+    if pid = safe_whereis(process_name) do
       opts = [to: pid, name: process_name] ++ state.subscription_options
       GenStage.async_subscribe(self(), opts)
       true
@@ -145,4 +145,10 @@ defmodule Broadway.Topology.Subscriber do
   end
 
   defp maybe_cancel(_), do: false
+
+  defp safe_whereis(name) do
+    GenServer.whereis(name)
+  rescue
+    _ -> nil
+  end
 end

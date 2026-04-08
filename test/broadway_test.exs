@@ -2907,6 +2907,472 @@ defmodule BroadwayTest do
     end
   end
 
+  describe "update_topology/2" do
+    test "updates processor concurrency without restarting producers" do
+      broadway = new_unique_name()
+
+      {:ok, _broadway} =
+        Broadway.start_link(Forwarder,
+          name: broadway,
+          context: %{test_pid: self()},
+          producer: [module: {ManualProducer, []}],
+          processors: [default: [concurrency: 1]]
+        )
+
+      producer_pid = GenServer.whereis(get_producer(broadway))
+
+      assert :ok = Broadway.update_topology(broadway, processors: [default: [concurrency: 3]])
+      assert_eventually(fn -> get_n_processors(broadway) == 3 end)
+
+      assert Broadway.topology(broadway)[:processors] == [
+               %{
+                 name: :"#{broadway}.Broadway.Processor_default",
+                 concurrency: 3,
+                 processor_key: :default
+               }
+             ]
+
+      assert GenServer.whereis(get_producer(broadway)) == producer_pid
+
+      :ok = Broadway.push_messages(broadway, wrap_messages([:a]))
+      assert_receive {:message_handled, :a}
+      assert_receive {:ack, _, [%Message{data: :a}], []}
+
+      assert :ok = Broadway.update_topology(broadway, processors: [default: [concurrency: 1]])
+      assert_eventually(fn -> get_n_processors(broadway) == 1 end)
+      assert GenServer.whereis(get_producer(broadway)) == producer_pid
+
+      :ok = Broadway.push_messages(broadway, wrap_messages([:b]))
+      assert_receive {:message_handled, :b}
+    end
+
+    test "updates batcher concurrency without restarting producers" do
+      broadway = new_unique_name()
+
+      {:ok, _broadway} =
+        Broadway.start_link(Forwarder,
+          name: broadway,
+          context: %{test_pid: self()},
+          producer: [module: {ManualProducer, []}],
+          processors: [default: [concurrency: 1]],
+          batchers: [default: [concurrency: 1, batch_size: 1]]
+        )
+
+      producer_pid = GenServer.whereis(get_producer(broadway))
+
+      assert :ok = Broadway.update_topology(broadway, batchers: [default: [concurrency: 2]])
+      assert_eventually(fn -> get_n_consumers(broadway, :default) == 2 end)
+      assert GenServer.whereis(get_producer(broadway)) == producer_pid
+
+      :ok = Broadway.push_messages(broadway, wrap_messages([:a]))
+      assert_receive {:batch_handled, :default, [%Message{data: :a}]}
+      assert_receive {:ack, _, [%Message{data: :a}], []}
+
+      assert :ok = Broadway.update_topology(broadway, batchers: [default: [concurrency: 1]])
+      assert_eventually(fn -> get_n_consumers(broadway, :default) == 1 end)
+      assert GenServer.whereis(get_producer(broadway)) == producer_pid
+
+      :ok = Broadway.push_messages(broadway, wrap_messages([:b]))
+      assert_receive {:batch_handled, :default, [%Message{data: :b}]}
+    end
+
+    test "rejects unsupported updates" do
+      broadway = new_unique_name()
+
+      {:ok, _broadway} =
+        Broadway.start_link(Forwarder,
+          name: broadway,
+          context: %{test_pid: self()},
+          producer: [module: {ManualProducer, []}],
+          processors: [default: [concurrency: 1, partition_by: & &1.data]],
+          batchers: [default: [concurrency: 1, batch_size: 1]]
+        )
+
+      assert_raise ArgumentError,
+                   "cannot resize processor :default when :partition_by is configured",
+                   fn ->
+                     Broadway.update_topology(broadway, processors: [default: [concurrency: 2]])
+                   end
+
+      broadway = new_unique_name()
+
+      {:ok, _broadway} =
+        Broadway.start_link(Forwarder,
+          name: broadway,
+          context: %{test_pid: self()},
+          producer: [module: {ManualProducer, []}],
+          processors: [default: [concurrency: 1]],
+          batchers: [default: [concurrency: 1, batch_size: 1, partition_by: & &1.data]]
+        )
+
+      assert_raise ArgumentError,
+                   "cannot resize batcher :default when :partition_by is configured",
+                   fn ->
+                     Broadway.update_topology(broadway, batchers: [default: [concurrency: 2]])
+                   end
+
+      assert_raise ArgumentError,
+                   "invalid options, unknown options [:invalid], valid options are: [:processors, :batchers]",
+                   fn ->
+                     Broadway.update_topology(broadway, invalid: [])
+                   end
+    end
+
+    test "waits for in-flight processor work before replacing processors" do
+      broadway = new_unique_name()
+
+      {:ok, _broadway} =
+        Broadway.start_link(CustomHandlersWithoutHandleBatch,
+          name: broadway,
+          producer: [module: {ManualProducer, []}],
+          processors: [default: [concurrency: 1]],
+          context: %{
+            test_pid: self(),
+            handle_message: fn message, context ->
+              data = message.data
+              send(context.test_pid, {:handle_message_started, message.data, self()})
+
+              receive do
+                {:release_message, ^data} -> message
+              end
+            end
+          }
+        )
+
+      producer_pid = GenServer.whereis(get_producer(broadway))
+      :ok = Broadway.push_messages(broadway, wrap_messages([:blocked]))
+
+      assert_receive {:handle_message_started, :blocked, processor_pid}
+
+      task =
+        Task.async(fn ->
+          Broadway.update_topology(broadway, processors: [default: [concurrency: 2]])
+        end)
+
+      assert Task.yield(task, 100) == nil
+
+      send(processor_pid, {:release_message, :blocked})
+
+      assert :ok = Task.await(task)
+      assert GenServer.whereis(get_producer(broadway)) == producer_pid
+      assert_eventually(fn -> get_n_processors(broadway) == 2 end)
+      assert_receive {:ack, _, [%Message{data: :blocked}], []}
+    end
+
+    test "waits for in-flight batch work before replacing batch processors" do
+      broadway = new_unique_name()
+
+      {:ok, _broadway} =
+        Broadway.start_link(CustomHandlers,
+          name: broadway,
+          producer: [module: {ManualProducer, []}],
+          processors: [default: [concurrency: 1]],
+          batchers: [default: [concurrency: 1, batch_size: 1]],
+          context: %{
+            test_pid: self(),
+            handle_message: fn message, _context -> message end,
+            handle_batch: fn batcher, messages, _batch_info, context ->
+              send(context.test_pid, {:handle_batch_started, batcher, messages, self()})
+
+              receive do
+                {:release_batch, ^batcher} -> messages
+              end
+            end
+          }
+        )
+
+      producer_pid = GenServer.whereis(get_producer(broadway))
+      :ok = Broadway.push_messages(broadway, wrap_messages([:blocked_batch]))
+
+      assert_receive {:handle_batch_started, :default, [%Message{data: :blocked_batch}],
+                      batch_pid}
+
+      task =
+        Task.async(fn ->
+          Broadway.update_topology(broadway, batchers: [default: [concurrency: 2]])
+        end)
+
+      assert Task.yield(task, 100) == nil
+
+      send(batch_pid, {:release_batch, :default})
+
+      assert :ok = Task.await(task)
+      assert GenServer.whereis(get_producer(broadway)) == producer_pid
+      assert_eventually(fn -> get_n_consumers(broadway, :default) == 2 end)
+      assert_receive {:ack, _, [%Message{data: :blocked_batch}], []}
+    end
+
+    test "supports repeated processor and batcher resize churn" do
+      broadway = new_unique_name()
+
+      {:ok, _broadway} =
+        Broadway.start_link(Forwarder,
+          name: broadway,
+          context: %{test_pid: self()},
+          producer: [module: {ManualProducer, []}],
+          processors: [default: [concurrency: 1]],
+          batchers: [default: [concurrency: 1, batch_size: 1]]
+        )
+
+      producer_pid = GenServer.whereis(get_producer(broadway))
+
+      for {processor_concurrency, batcher_concurrency, message} <- [
+            {2, 2, :one},
+            {3, 1, :two},
+            {1, 3, :three},
+            {2, 1, :four}
+          ] do
+        assert :ok =
+                 Broadway.update_topology(broadway,
+                   processors: [default: [concurrency: processor_concurrency]],
+                   batchers: [default: [concurrency: batcher_concurrency]]
+                 )
+
+        assert_eventually(fn -> get_n_processors(broadway) == processor_concurrency end)
+        assert_eventually(fn -> get_n_consumers(broadway, :default) == batcher_concurrency end)
+        assert GenServer.whereis(get_producer(broadway)) == producer_pid
+
+        :ok = Broadway.push_messages(broadway, wrap_messages([message]))
+        assert_receive {:batch_handled, :default, [%Message{data: ^message}]}
+      end
+    end
+
+    test "serializes concurrent update_topology/2 calls" do
+      broadway = new_unique_name()
+
+      {:ok, _broadway} =
+        Broadway.start_link(CustomHandlersWithoutHandleBatch,
+          name: broadway,
+          producer: [module: {ManualProducer, []}],
+          processors: [default: [concurrency: 1]],
+          context: %{
+            test_pid: self(),
+            handle_message: fn message, context ->
+              data = message.data
+              send(context.test_pid, {:handle_message_started, data, self()})
+
+              receive do
+                {:release_message, ^data} -> message
+              end
+            end
+          }
+        )
+
+      producer_pid = GenServer.whereis(get_producer(broadway))
+      :ok = Broadway.push_messages(broadway, wrap_messages([:serialized]))
+      assert_receive {:handle_message_started, :serialized, processor_pid}
+
+      task1 =
+        Task.async(fn ->
+          Broadway.update_topology(broadway, processors: [default: [concurrency: 2]])
+        end)
+
+      task2 =
+        Task.async(fn ->
+          Broadway.update_topology(broadway, processors: [default: [concurrency: 3]])
+        end)
+
+      assert Task.yield(task1, 100) == nil
+      assert Task.yield(task2, 100) == nil
+
+      send(processor_pid, {:release_message, :serialized})
+
+      assert :ok = Task.await(task1)
+      assert :ok = Task.await(task2)
+      assert_receive {:ack, _, [%Message{data: :serialized}], []}
+      assert GenServer.whereis(get_producer(broadway)) == producer_pid
+      assert_eventually(fn -> get_n_processors(broadway) == 3 end)
+    end
+
+    test "resizes multiple batchers in one call" do
+      broadway = new_unique_name()
+
+      {:ok, _broadway} =
+        Broadway.start_link(CustomHandlers,
+          name: broadway,
+          producer: [module: {ManualProducer, []}],
+          processors: [default: [concurrency: 1]],
+          batchers: [
+            default: [concurrency: 1, batch_size: 1],
+            b1: [concurrency: 1, batch_size: 1]
+          ],
+          context: %{
+            test_pid: self(),
+            handle_message: fn message, _context ->
+              case message.data do
+                {:default, _} -> message
+                {:b1, _} -> Broadway.Message.put_batcher(message, :b1)
+              end
+            end,
+            handle_batch: fn batcher, messages, batch_info, context ->
+              send(context.test_pid, {:batch_handled_with_info, batcher, messages, batch_info})
+              messages
+            end
+          }
+        )
+
+      assert :ok =
+               Broadway.update_topology(broadway,
+                 batchers: [default: [concurrency: 2], b1: [concurrency: 3]]
+               )
+
+      assert_eventually(fn -> get_n_consumers(broadway, :default) == 2 end)
+      assert_eventually(fn -> get_n_consumers(broadway, :b1) == 3 end)
+
+      :ok =
+        Broadway.push_messages(
+          broadway,
+          wrap_messages([{:default, 1}, {:b1, 2}])
+        )
+
+      assert_receive {:batch_handled_with_info, :default, [%Message{data: {:default, 1}}], _}
+      assert_receive {:batch_handled_with_info, :b1, [%Message{data: {:b1, 2}}], _}
+    end
+
+    test "resizes while a producer crashes and recovers" do
+      broadway = new_unique_name()
+      test_pid = self()
+
+      {:ok, _broadway} =
+        Broadway.start_link(CustomHandlersWithoutHandleBatch,
+          name: broadway,
+          resubscribe_interval: 0,
+          producer: [module: {ManualProducer, []}],
+          processors: [default: [concurrency: 1]],
+          context: %{
+            test_pid: test_pid,
+            handle_message: fn message, context ->
+              data = message.data
+              send(context.test_pid, {:handle_message_started, data, self()})
+
+              receive do
+                {:release_message, ^data} -> message
+              end
+            end
+          }
+        )
+
+      producer = get_producer(broadway)
+      producer_pid = GenServer.whereis(producer)
+
+      :ok = Broadway.push_messages(broadway, wrap_messages([:blocked_resize]))
+      assert_receive {:handle_message_started, :blocked_resize, processor_pid}
+
+      task =
+        Task.async(fn ->
+          Broadway.update_topology(broadway, processors: [default: [concurrency: 2]])
+        end)
+
+      assert Task.yield(task, 100) == nil
+
+      GenStage.stop(producer)
+      assert_eventually(fn ->
+        case GenServer.whereis(producer) do
+          pid when is_pid(pid) -> pid != producer_pid
+          _ -> false
+        end
+      end)
+
+      send(processor_pid, {:release_message, :blocked_resize})
+
+      assert :ok = Task.await(task)
+      assert_eventually(fn -> get_n_processors(broadway) == 2 end)
+      assert GenServer.whereis(producer) != producer_pid
+
+      :ok = Broadway.push_messages(broadway, wrap_messages([:after_restart]))
+      assert_receive {:handle_message_started, :after_restart, next_processor_pid}
+      send(next_processor_pid, {:release_message, :after_restart})
+      assert_receive {:ack, _, [%Message{data: :after_restart}], []}
+    end
+
+    test "resizes while demand is buffered under producer rate limiting" do
+      broadway = new_unique_name()
+
+      {:ok, _broadway} =
+        Broadway.start_link(Forwarder,
+          name: broadway,
+          context: %{test_pid: self()},
+          producer: [
+            module: {ManualProducer, []},
+            concurrency: 1,
+            rate_limiting: [allowed_messages: 2, interval: 10000]
+          ],
+          processors: [default: [concurrency: 1, max_demand: 2]]
+        )
+
+      producer_pid = GenServer.whereis(get_producer(broadway))
+
+      send(get_producer(broadway), {:push_messages, wrap_messages([1, 2, 3])})
+
+      assert_receive {:message_handled, 1}
+      assert_receive {:message_handled, 2}
+      assert_receive_ack_data([1, 2])
+      refute_receive {:message_handled, 3}
+
+      task =
+        Task.async(fn ->
+          Broadway.update_topology(broadway, processors: [default: [concurrency: 2]])
+        end)
+
+      assert Task.yield(task, 100) == nil
+      refute_receive {:message_handled, 3}
+
+      send(get_rate_limiter(broadway), :reset_limit)
+
+      assert_receive {:message_handled, 3}
+      assert_receive_ack_data([3])
+      assert :ok = Task.await(task)
+      assert_eventually(fn -> get_n_processors(broadway) == 2 end)
+      assert GenServer.whereis(get_producer(broadway)) == producer_pid
+
+      :ok = Broadway.push_messages(broadway, wrap_messages([4]))
+      assert_receive {:message_handled, 4}
+      assert_receive {:ack, _, [%Message{data: 4}], []}
+    end
+
+    test "returns immediately for a no-op resize while messages are in flight" do
+      broadway = new_unique_name()
+
+      {:ok, _broadway} =
+        Broadway.start_link(CustomHandlersWithoutHandleBatch,
+          name: broadway,
+          producer: [module: {ManualProducer, []}],
+          processors: [default: [concurrency: 1]],
+          context: %{
+            test_pid: self(),
+            handle_message: fn message, context ->
+              data = message.data
+              send(context.test_pid, {:handle_message_started, data, self()})
+
+              receive do
+                {:release_message, ^data} -> message
+              end
+            end
+          }
+        )
+
+      producer_pid = GenServer.whereis(get_producer(broadway))
+      processor_pid = GenServer.whereis(get_processor(broadway, :default))
+
+      :ok = Broadway.push_messages(broadway, wrap_messages([:no_op]))
+      assert_receive {:handle_message_started, :no_op, ^processor_pid}
+
+      task =
+        Task.async(fn ->
+          Broadway.update_topology(broadway, processors: [default: [concurrency: 1]])
+        end)
+
+      assert :ok = Task.await(task)
+      assert GenServer.whereis(get_producer(broadway)) == producer_pid
+      assert GenServer.whereis(get_processor(broadway, :default)) == processor_pid
+      assert get_n_processors(broadway) == 1
+
+      send(processor_pid, {:release_message, :no_op})
+
+      assert_receive {:ack, _, [%Message{data: :no_op}], []}
+    end
+  end
+
   describe "all_running/0" do
     test "return running pipeline names" do
       broadway = new_unique_name()
@@ -3019,6 +3485,22 @@ defmodule BroadwayTest do
              ] = Broadway.topology(name)
     end
 
+    test "Broadway.update_topology/2", %{name: name} do
+      producer_pid = GenServer.whereis(via_tuple({:broadway, "Producer_0"}))
+
+      assert :ok = Broadway.update_topology(name, processors: [default: [concurrency: 2]])
+
+      assert Broadway.topology(name)[:processors] == [
+               %{
+                 name: via_tuple({:broadway, "Processor_default"}),
+                 concurrency: 2,
+                 processor_key: :default
+               }
+             ]
+
+      assert GenServer.whereis(via_tuple({:broadway, "Producer_0"})) == producer_pid
+    end
+
     test "Broadway.test_message/2", %{name: name} do
       ref = Broadway.test_message(name, :message)
 
@@ -3078,6 +3560,53 @@ defmodule BroadwayTest do
 
   defp get_n_consumers(broadway_name, key) do
     Supervisor.count_children(:"#{broadway_name}.Broadway.BatchProcessorSupervisor_#{key}").workers
+  end
+
+  defp assert_eventually(fun, timeout \\ 1_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+    assert_eventually(fun, deadline, timeout)
+  end
+
+  defp assert_eventually(fun, deadline, timeout) do
+    if fun.() do
+      true
+    else
+      if System.monotonic_time(:millisecond) < deadline do
+        Process.sleep(10)
+        assert_eventually(fun, deadline, timeout)
+      else
+        flunk("condition not met within #{timeout}ms")
+      end
+    end
+  end
+
+  defp assert_receive_ack_data(expected, timeout \\ 1_000) do
+    pending = MapSet.new(expected)
+    deadline = System.monotonic_time(:millisecond) + timeout
+    assert_receive_ack_data(pending, deadline, timeout)
+  end
+
+  defp assert_receive_ack_data(pending, deadline, timeout) do
+    if MapSet.size(pending) == 0 do
+      :ok
+    else
+      receive do
+        {:ack, _, messages, []} ->
+          pending =
+            Enum.reduce(messages, pending, fn %Message{data: data}, acc ->
+              MapSet.delete(acc, data)
+            end)
+
+          assert_receive_ack_data(pending, deadline, timeout)
+      after
+        10 ->
+          if System.monotonic_time(:millisecond) < deadline do
+            assert_receive_ack_data(pending, deadline, timeout)
+          else
+            flunk("acks not received within #{timeout}ms: #{inspect(MapSet.to_list(pending))}")
+          end
+      end
+    end
   end
 
   defp async_push_messages(producer, list) do

@@ -35,6 +35,10 @@ defmodule Broadway.Topology do
     config(server).topology
   end
 
+  def update_topology(server, opts) do
+    GenServer.call(server, {:update_topology, opts}, :infinity)
+  end
+
   defp config(server) do
     config_storage = ConfigStorage.get_module()
 
@@ -69,6 +73,7 @@ defmodule Broadway.Topology do
 
     {:ok,
      %{
+       config: config,
        supervisor_pid: supervisor_pid,
        terminator: config.terminator,
        name: config.name
@@ -82,6 +87,25 @@ defmodule Broadway.Topology do
 
   def handle_info(_, state) do
     {:noreply, state}
+  end
+
+  @impl true
+  def handle_call({:update_topology, opts}, _from, %{config: config} = state) do
+    with :ok <- validate_runtime_update(config, opts) do
+      config = update_config(config, opts)
+
+      if config == state.config do
+        {:reply, :ok, state}
+      else
+        drain_downstream(state.config)
+        replace_downstream_children(state.supervisor_pid, config)
+        put_config(config)
+        {:reply, :ok, %{state | config: config, terminator: config.terminator}}
+      end
+    else
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
   end
 
   @impl true
@@ -190,6 +214,19 @@ defmodule Broadway.Topology do
     }
 
     :telemetry.execute([:broadway, :topology, :init], measurements, metadata)
+  end
+
+  defp put_config(config) do
+    config_storage = ConfigStorage.get_module()
+
+    config_storage.put(config.name, %__MODULE__{
+      context: config.context,
+      topology: build_topology_details(config),
+      producer_names: process_names(config, "Producer", config.producer_config),
+      batchers_names:
+        Enum.map(config.batchers_config, &process_name(config, "Batcher", elem(&1, 0))),
+      rate_limiter_name: config.rate_limiter
+    })
   end
 
   defp start_options(name, config) do
@@ -470,6 +507,155 @@ defmodule Broadway.Topology do
           }
         end)
     ]
+  end
+
+  defp update_config(config, opts) do
+    config
+    |> update_processors_config(opts[:processors] || [])
+    |> update_batchers_config(opts[:batchers] || [])
+  end
+
+  defp validate_runtime_update(config, opts) do
+    with :ok <- validate_partitioned_processors(config, opts[:processors] || []),
+         :ok <- validate_partitioned_batchers(config, opts[:batchers] || []) do
+      :ok
+    end
+  end
+
+  defp validate_partitioned_processors(_config, []), do: :ok
+
+  defp validate_partitioned_processors(config, updates) do
+    Enum.reduce_while(updates, :ok, fn {key, _opts}, :ok ->
+      case Keyword.fetch!(config.processors_config, key)[:partition_by] do
+        nil -> {:cont, :ok}
+        _ -> {:halt, {:error, {:partitioned_processor, key}}}
+      end
+    end)
+  end
+
+  defp validate_partitioned_batchers(_config, []), do: :ok
+
+  defp validate_partitioned_batchers(config, updates) do
+    Enum.reduce_while(updates, :ok, fn {key, _opts}, :ok ->
+      case Keyword.fetch!(config.batchers_config, key)[:partition_by] do
+        nil -> {:cont, :ok}
+        _ -> {:halt, {:error, {:partitioned_batcher, key}}}
+      end
+    end)
+  end
+
+  defp update_processors_config(config, []), do: config
+
+  defp update_processors_config(config, processors_opts) do
+    processors_config =
+      Enum.map(config.processors_config, fn {key, processor_config} = current ->
+        case Keyword.fetch(processors_opts, key) do
+          {:ok, opts} ->
+            if opts[:concurrency] == processor_config[:concurrency] do
+              current
+            else
+              {key, Keyword.put(processor_config, :concurrency, opts[:concurrency])}
+            end
+
+          :error ->
+            current
+        end
+      end)
+
+    %{config | processors_config: processors_config}
+  end
+
+  defp update_batchers_config(config, []), do: config
+
+  defp update_batchers_config(config, batchers_opts) do
+    batchers_config =
+      Enum.map(config.batchers_config, fn {key, batcher_config} = current ->
+        case Keyword.fetch(batchers_opts, key) do
+          {:ok, opts} ->
+            if opts[:concurrency] == batcher_config[:concurrency] do
+              current
+            else
+              {key, Keyword.put(batcher_config, :concurrency, opts[:concurrency])}
+            end
+
+          :error ->
+            current
+        end
+      end)
+
+    %{config | batchers_config: batchers_config}
+  end
+
+  defp drain_downstream(config) do
+    Terminator.drain(config.terminator)
+  end
+
+  defp downstream_names(config) do
+    producers = process_names(config, "Producer", config.producer_config)
+    [{processor_key, processor_config}] = config.processors_config
+    processors = process_names(config, "Processor_#{processor_key}", processor_config)
+
+    batch_processors =
+      Enum.flat_map(config.batchers_config, fn {key, batcher_config} ->
+        process_names(config, "BatchProcessor_#{key}", batcher_config)
+      end)
+
+    last = if batch_processors == [], do: processors, else: batch_processors
+    {producers, processors, last}
+  end
+
+  defp replace_downstream_children(top_supervisor, config) do
+    terminate_and_delete_child(top_supervisor, config.terminator)
+
+    if config.batchers_config != [] do
+      terminate_and_delete_child(top_supervisor, process_name(config, "BatchersSupervisor"))
+    end
+
+    terminate_and_delete_child(top_supervisor, process_name(config, "ProcessorSupervisor"))
+
+    {producers_names, _producers_specs} = build_producers_specs(config, name: config.name)
+    {processors_names, processors_specs} = build_processors_specs(config, producers_names)
+
+    {:ok, _pid} =
+      Supervisor.start_child(
+        top_supervisor,
+        build_processor_supervisor_spec(config, processors_specs)
+      )
+
+    if config.batchers_config == [] do
+      :ok
+    else
+      {_batch_processors_names, batcher_supervisors_specs} =
+        build_batcher_supervisors_specs(config, processors_names)
+
+      {:ok, _pid} =
+        Supervisor.start_child(
+          top_supervisor,
+          build_batchers_supervisor_spec(config, batcher_supervisors_specs)
+        )
+    end
+
+    {_, _, last} = downstream_names(config)
+
+    {:ok, _pid} =
+      Supervisor.start_child(
+        top_supervisor,
+        build_terminator_spec(config, producers_names, processors_names, last)
+      )
+  end
+
+  defp terminate_and_delete_child(top_supervisor, child_name) do
+    child_id =
+      top_supervisor
+      |> Supervisor.which_children()
+      |> Enum.find_value(fn {id, pid, _type, _modules} ->
+        if pid == GenServer.whereis(child_name), do: id
+      end)
+
+    if child_id do
+      :ok = Supervisor.terminate_child(top_supervisor, child_id)
+      :ok = Supervisor.delete_child(top_supervisor, child_id)
+    end
   end
 
   defp process_name(config, base_name, suffix) do

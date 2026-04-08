@@ -1257,6 +1257,43 @@ defmodule Broadway do
   end
 
   @doc """
+  Updates processor and batcher concurrency at runtime.
+
+  Supported options:
+
+    * `:processors` - a keyword list of existing processor keys whose values support
+      the `:concurrency` option
+    * `:batchers` - a keyword list of existing batcher keys whose values support
+      the `:concurrency` option
+
+  Broadway keeps the producer tree running and recreates the downstream stages with
+  the new concurrency values.
+
+  Resizing processors with `:partition_by` configured is not supported because the
+  producer partition dispatcher is fixed when the pipeline starts. Resizing batchers
+  with `:partition_by` configured is also not supported for the same reason.
+  """
+  @doc since: "1.2.0"
+  @spec update_topology(server :: name(), opts :: Keyword.t()) :: :ok
+  def update_topology(broadway, opts) when is_broadway_name(broadway) and is_list(opts) do
+    topology = Topology.topology(broadway)
+    validate_topology_update!(topology, opts)
+
+    case Topology.update_topology(broadway, opts) do
+      :ok ->
+        :ok
+
+      {:error, {:partitioned_processor, key}} ->
+        raise ArgumentError,
+              "cannot resize processor #{inspect(key)} when :partition_by is configured"
+
+      {:error, {:partitioned_batcher, key}} ->
+        raise ArgumentError,
+              "cannot resize batcher #{inspect(key)} when :partition_by is configured"
+    end
+  end
+
+  @doc """
   Returns all running Broadway names.
 
   It's important to notice that no order is guaranteed.
@@ -1537,4 +1574,44 @@ defmodule Broadway do
       when is_broadway_name(broadway) or is_pid(broadway) do
     GenServer.stop(broadway, reason, timeout)
   end
+
+  defp validate_topology_update!(topology, opts) do
+    valid_keys = [:processors, :batchers]
+    invalid_keys = Keyword.keys(opts) -- valid_keys
+
+    if invalid_keys != [] do
+      raise ArgumentError,
+            "invalid options, unknown options #{inspect(invalid_keys)}, valid options are: #{inspect(valid_keys)}"
+    end
+
+    validate_stage_updates!(opts[:processors] || [], topology[:processors], :processor)
+    validate_stage_updates!(opts[:batchers] || [], topology[:batchers], :batcher)
+  end
+
+  defp validate_stage_updates!([], _stages, _type), do: :ok
+
+  defp validate_stage_updates!(updates, stages, type) when is_list(updates) do
+    Enum.each(updates, fn
+      {key, [{:concurrency, value}]} when is_integer(value) and value > 0 ->
+        if not Enum.any?(stages, &match_stage?(&1, key, type)) do
+          raise ArgumentError, "unknown #{type} #{inspect(key)}"
+        end
+
+      {key, invalid_opts} when is_list(invalid_opts) ->
+        raise ArgumentError,
+              "invalid options for #{type} #{inspect(key)}, expected [concurrency: pos_integer()], got: #{inspect(invalid_opts)}"
+
+      other ->
+        raise ArgumentError,
+              "invalid #{type} update, expected {key, [concurrency: pos_integer()]}, got: #{inspect(other)}"
+    end)
+  end
+
+  defp validate_stage_updates!(updates, _stages, type) do
+    raise ArgumentError,
+          "invalid #{type} updates, expected a keyword list, got: #{inspect(updates)}"
+  end
+
+  defp match_stage?(stage, key, :processor), do: stage[:processor_key] == key
+  defp match_stage?(stage, key, :batcher), do: stage[:batcher_key] == key
 end
